@@ -1,8 +1,9 @@
 META_URL = 'http://media.mtvnservices.com/pmt/e1/access/index.html?uri=%s&configtype=edge'
-MEDIA_URL = 'http://media-utils.mtvnservices.com/services/MediaGenerator/%s?device=iPad&format=json'
 URI = 'mgid:arc:%s:comedycentral.com:%s'
 
-RE_ID = Regex('ccnetworkapp:.{2,4}(?P<type>episode|video).{1,2}(?P<uuid>[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})')
+RE_ID = Regex('ccnetworkapp\/(?P<type>episode|video)\/(?P<uuid>[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})')
+RE_MANIFEST = Regex('var triforceManifestFeed = (.+?);', Regex.DOTALL)
+RE_B = Regex('(&__b__=)\d+')
 
 ####################################################################################################
 def NormalizeURL(url):
@@ -13,6 +14,16 @@ def NormalizeURL(url):
 def MetadataObjectForURL(url):
 
 	json_obj = JSON.ObjectFromURL(META_URL % (GetURI(url)), cacheTime=CACHE_1HOUR, headers={'Referer': url})['feed']
+
+	# Check for geoblocks or errors
+	if not 'items' in json_obj:
+
+		if 'errorSlateURL' in json_obj and 'video_loc_' in json_obj['errorSlateURL']:
+			Log('Media Geoblocked')
+			raise Ex.MediaGeoblocked
+		else:
+			Log('Media Not Available')
+			raise Ex.MediaNotAvailable
 
 	duration = 0
 
@@ -32,7 +43,7 @@ def MetadataObjectForURL(url):
 def MediaObjectsForURL(url):
 
 	json_obj = JSON.ObjectFromURL(META_URL % (GetURI(url)), cacheTime=CACHE_1HOUR, headers={'Referer': url})['feed']
-	available_streams = {}
+	part_objects = []
 
 	# Check for geoblocks or errors
 	if not 'items' in json_obj:
@@ -49,54 +60,38 @@ def MediaObjectsForURL(url):
 		if item['duration'] < 8:
 			continue
 
-		json_obj = JSON.ObjectFromURL(MEDIA_URL % (item['guid']), cacheTime=CACHE_1HOUR)
+		media_url = item['group']['content'].replace('{device}', 'iPad') + '&format=json'
+		if media_url.startswith('//'):
+			media_url = 'https:' + media_url
+
+		json_obj = JSON.ObjectFromURL(media_url, cacheTime=CACHE_1HOUR)
 
 		if not 'rendition' in json_obj['package']['video']['item'][0]:
 			continue
 
-		for rendition in json_obj['package']['video']['item'][0]['rendition']:
+		try:
+			part_hls_url = RE_B.sub(r'\g<1>5000', json_obj['package']['video']['item'][0]['rendition'][0]['src'])
+			part_duration = json_obj['package']['video']['item'][0]['rendition'][0]['duration']
 
-			hls_url = rendition['src']
-			bitrate = '1200'
-
-			if bitrate not in available_streams:
-				available_streams[bitrate] = []
-
-			part = {}
-			part['hls_url'] = hls_url
-			part['duration'] = rendition['duration']
-
-			available_streams[bitrate].append(part)
-
-	media_objects = []
-	bitrates = [int(i) for i in available_streams.keys()]
-	bitrates.sort(reverse=True)
-
-	for bitrate in bitrates:
-
-		parts = []
-
-		for part in available_streams[str(bitrate)]:
-
-			parts.append(
+			part_objects.append(
 				PartObject(
-					key = HTTPLiveStreamURL(
-						url = part['hls_url']
-					),
-					duration = int(part['duration'])*1000
+					key = HTTPLiveStreamURL(part_hls_url),
+					duration = int(part_duration)*1000
 				)
 			)
+		except:
+			continue
 
-		media_objects.append(
-			MediaObject(
-				parts = parts,
-				bitrate = bitrate,
-				video_resolution = 720,
-				audio_channels = 2
-			)
+	if len(part_objects) < 1:
+		raise Ex.MediaNotAvailable
+
+	return [
+		MediaObject(
+			parts = part_objects,
+			video_resolution = 720,
+			audio_channels = 2
 		)
-
-	return media_objects
+	]
 
 ####################################################################################################
 def GetURI(url):
@@ -116,6 +111,13 @@ def GetURI(url):
 
 	if not re_result:
 		Log('RE_ID regex failed')
-		raise Ex.MediaNotAvailable
+		try: 
+			json = JSON.ObjectFromString(RE_MANIFEST.search(page).group(1))
+			uuid = json['manifest']['reporting']['itemId']
+			type = json['manifest']['pageClass'].split('-')[1].split('playerpage')[0]
+			uri = URI % (type, uuid)
+		except: raise Ex.MediaNotAvailable
+	else:
+		uri = URI % (re_result.group('type'), re_result.group('uuid'))
 
-	return URI % (re_result.group('type'), re_result.group('uuid'))
+	return uri

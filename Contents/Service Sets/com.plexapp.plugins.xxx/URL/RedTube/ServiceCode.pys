@@ -1,6 +1,6 @@
-RE_VIDEO_URL = Regex('<source src="(?P<video_url>[^"]+)" type="video/mp4">')
 RE_VIDEO_ID = Regex('redtube\.com/(?P<video_id>\d+)')
-API_URL = 'http://api.redtube.com/?data=redtube.Videos.getVideoById&video_id=%s&output=json'
+RE_JSON = Regex('mediaDefinition:.*(\[.+?\])')
+API_URL = 'https://api.redtube.com/?data=redtube.Videos.getVideoById&video_id=%s&output=json'
 
 ####################################################################################################
 def NormalizeURL(url):
@@ -26,7 +26,7 @@ def MetadataObjectForURL(url):
 		data = data['video']
 
 	title = data['title']
-	thumb = 'http:'+data['thumb'].replace('m.jpg', 'b.jpg')
+	thumb = data['default_thumb']
 
 	try: duration = TimeToMs(data['duration'])
 	except: duration = None
@@ -53,9 +53,8 @@ def MetadataObjectForURL(url):
 		tags = tags,
 		originally_available_at = originally_available_at,
 		year = year,
-		genres = ['XXX','Adult','18+'],
-		content_rating_age = 18,
-		source_title = 'RedTube'
+		genres = ['XXX', 'Adult', '18+'],
+		content_rating_age = 18
 	)
 
 ####################################################################################################
@@ -63,43 +62,47 @@ def MediaObjectsForURL(url):
 
 	return [
 		MediaObject(
+			container = Container.MP4,
 			video_codec = VideoCodec.H264,
+			video_resolution = video_resolution,
 			audio_codec = AudioCodec.AAC,
-			container = 'mp4',
-			parts = [PartObject(key=Callback(PlayVideo, url=url))]
-		)
+			audio_channels = 2,
+			optimized_for_streaming = True,
+			parts = [
+				PartObject(
+					key = Callback(PlayVideo, url=url, res=video_resolution)
+				)
+			]
+		) for video_resolution in ['720', '480']
 	]
 
 ####################################################################################################
 @indirect
-def PlayVideo(url, **kwargs):
+def PlayVideo(url, res='720', **kwargs):
 
 	try:
-		page = HTTP.Request(url).content
+		data = HTTP.Request(url).content
 	except:
 		raise Ex.MediaNotAvailable
 
-	video_url = RE_VIDEO_URL.search(page)
+	json = RE_JSON.search(data)
+	json_obj = JSON.ObjectFromString(json.group(1))
 
-	if not video_url:
-		raise Ex.MediaNotAvailable
+	available_versions = {}
 
-	return IndirectResponse(VideoClipObject, key='http://%s' % (video_url.group('video_url').split('//')[-1]))
+	for version in json_obj:
+		available_versions[version['quality']] = version['videoUrl']
 
-####################################################################################################
-def TestURLs():
+	if res == '720' and '720' in available_versions:
+		video_url = available_versions['720']
+	elif '480' in available_versions:
+		video_url = available_versions['480']
+	else:
+		video_url = available_versions[available_versions.keys()[0]]
 
-	test_urls = []
-	data = JSON.ObjectFromURL('http://api.redtube.com/?data=redtube.Videos.searchVideos&output=json')
+	video_url = 'https://%s' % (video_url.split('//')[-1])
 
-	for video in data['videos']:
-		url = video['video']['url']
-		test_urls.append(url)
-
-		if len(test_urls) == 3:
-			break
-
-	return test_urls
+	return IndirectResponse(VideoClipObject, key=video_url)
 
 ####################################################################################################
 def TimeToMs(timecode):

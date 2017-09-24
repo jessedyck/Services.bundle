@@ -1,55 +1,44 @@
-SHOWS_URL = 'http://tveatc-usa.nbcuni.com/awe3/live/5/nbce/containers/iPadRetina'
-VIDEOS_URL = 'http://tveatc-usa.nbcuni.com/awe3/live/5/nbce/containers/iPadRetina/%s'
+VIDGUID_URL = 'https://api.nbc.com/v3.14/videos?filter[guid]=%s&include=image'
+NAMESPACES = {"a": "http://www.w3.org/2005/SMIL21/Language"}
 
-RE_VIDEO_ID = Regex('nbc\.com/((?!Vintage_Shows).+/)?video/.+?/(?P<id>\d{7})')
-RE_CLEANUP_TITLE = Regex('[^a-z0-9]+')
+SMIL_EXT = '&policy=43674&formats=m3u,mpeg4&format=SMIL&embedded=true'
+
+RE_VIDEO_GUID_URL = Regex('\/video\/.+\/(\d{7})')
+RE_VIDEO_GUID_BODY = Regex('"guid":"(.+?)"')
+
+HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_6) AppleWebKit/603.3.8 (KHTML, like Gecko) Version/10.1.2 Safari/603.3.8"}
 
 ####################################################################################################
 def NormalizeURL(url):
 
-	if '#' in url and '|' in url and not '?' in url:
-		return url
-
-	return url.split('#')[0].split('?')[0]
+	return url.split('?')[0]
 
 ####################################################################################################
 def MetadataObjectForURL(url):
 
-	video_id = RE_VIDEO_ID.search(url)
+	json = GetMediaData(url)
+	episode = json['data'][0]
 
-	if not video_id:
-		raise Ex.MediaNotAvailable
-
-	video_id = video_id.group('id')
 	show = None
-	season = None
-	index = None
 
-	(episodes_url, video_id) = GetEpisodeData(url, video_id)
-	found_episode = False
-
-	for episode in JSON.ObjectFromURL(episodes_url)['results']:
-
-		if episode['assetID'].endswith(video_id):
-
-			show = episode['parentContainerTitle']
-			season = episode['seasonNumber'] if 'seasonNumber' in episode else None
-			index = episode['episodeNumber'] if 'episodeNumber' in episode else None
-			title = episode['title']
-			summary = episode['description']
-			duration = episode['totalDuration']
-			originally_available_at = Datetime.FromTimestamp(episode['firstAiredDate']).date()
-
-			try:
-				thumb = episode['images'][0]['images']['video_thumbnail_16_by_9']
-			except:
-				thumb = ''
-
-			found_episode = True
+	for item in episode['attributes']['categories']: 
+		if item.startswith('Series'):
+			show = item.split('Series/')[1]
 			break
 
-	if not found_episode:
-		raise Ex.MediaNotAvailable
+	try: index = int(episode['attributes']['episodeNumber'])
+	except: index = None
+
+	try: season = int(episode['attributes']['seasonNumber'])
+	except: season = None
+
+	duration = int(episode['attributes']['runTime']) * 1000
+	date = Datetime.ParseDate(episode['attributes']['airdate'])
+	title = episode['attributes']['title']
+	summary = episode['attributes']['description']
+
+	try: thumb = 'https://www.nbc.com' + json['included'][0]['attributes']['path']
+	except: thumb = ''
 
 	if show and season and index:
 
@@ -61,16 +50,17 @@ def MetadataObjectForURL(url):
 			summary = summary,
 			duration = duration,
 			thumb = Resource.ContentsOfURLWithFallback(thumb),
-			originally_available_at = originally_available_at
+			originally_available_at = date
 		)
 
 	else:
+
 		return VideoClipObject(
 			title = title,
 			summary = summary,
 			duration = duration,
 			thumb = Resource.ContentsOfURLWithFallback(thumb),
-			originally_available_at = originally_available_at
+			originally_available_at = date
 		)
 
 ####################################################################################################
@@ -83,8 +73,8 @@ def MediaObjectsForURL(url):
 					key=HTTPLiveStreamURL(Callback(PlayVideo, url=url))
 				)
 			],
-			video_resolution = '720',
 			audio_channels = 2,
+			video_resolution = 720,
 			optimized_for_streaming = True
 		)
 	]
@@ -93,88 +83,41 @@ def MediaObjectsForURL(url):
 @indirect
 def PlayVideo(url, **kwargs):
 
-	video_id = RE_VIDEO_ID.search(url)
+	json = GetMediaData(url)
+	episode = json['data'][0]
 
-	if not video_id:
+	smil_url = episode['attributes']['mediaUrl'] + SMIL_EXT
+
+	try: 
+		smil = XML.ElementFromURL(smil_url, headers=HTTP_HEADERS)
+	except: 
 		raise Ex.MediaNotAvailable
 
-	video_id = video_id.group('id')
+	videos =  smil.xpath('//a:video/@src', namespaces=NAMESPACES)
 
-	(episodes_url, video_id) = GetEpisodeData(url, video_id)
-	found_episode = False
-
-	try:
-		json_obj = JSON.ObjectFromURL(episodes_url)['results']
-	except:
-		raise Ex.MediaNotAvailable
-
-	for episode in json_obj:
-
-		if episode['assetID'].endswith(video_id):
-
-			m3u8_url = episode['videoURL']
-			found_episode = True
-			break
-
-	if not found_episode:
-		raise Ex.MediaNotAvailable
-
-	try:
-		m3u8 = HTTP.Request(m3u8_url, cacheTime=10, follow_redirects=False).content
-	except Ex.RedirectError, e:
-		if 'Location' in e.headers:
-			m3u8_url = e.headers['Location']
-	except Ex.HTTPError, e:
-		if e.code == 403:
-			raise Ex.MediaGeoblocked
-		elif e.code == 404:
-			raise Ex.MediaNotAvailable
-		else:
-			raise Ex.MediaNotAvailable
-	except:
+	if len(videos) < 1:
 		raise Ex.MediaNotAvailable
 
 	return IndirectResponse(VideoClipObject,
-		key = HTTPLiveStreamURL(m3u8_url)
+		key = HTTPLiveStreamURL(videos[0])
 	)
 
 ####################################################################################################
-def GetEpisodeData(url, video_id):
+def GetMediaData(url):
 
-	# URL Service requests coming from the NBC channel already have some of the required information
-	# added to the end of the URL, after the anchor.
+	video_guid = RE_VIDEO_GUID_URL.search(url)
 
-	if '#' in url:
+	if not video_guid:
 
-		(show_id, video_id) = url.split('#')[-1].split('|')
+		page = HTTP.Request(url, headers=HTTP_HEADERS, cacheTime=CACHE_1HOUR).content
+		video_guid = RE_VIDEO_GUID_BODY.search(page)
 
-		try:
-			test = HTTP.Request(VIDEOS_URL % show_id).content
-			return (VIDEOS_URL % (show_id), video_id)
-		except:
-			return GetEpisodeData(url.split('#')[0], video_id)
+	if not video_guid:
+		raise Ex.MediaNotAvailable
 
-	else:
+	video_api = VIDGUID_URL % (video_guid.group(1))
 
-		# Get the show name
-		try:
-			html = HTML.ElementFromURL(url)
-		except:
-			raise Ex.MediaNotAvailable
-
-		try:
-			show_name = html.xpath('//meta[@property="og:url"]/@content')[0].split('/')[3]
-			show_name = RE_CLEANUP_TITLE.sub('', show_name)
-		except:
-			raise Ex.MediaNotAvailable
-
-		for show in JSON.ObjectFromURL(SHOWS_URL)['results']:
-
-			show_title = RE_CLEANUP_TITLE.sub('', show['title'].lower())
-			show_asset_id = RE_CLEANUP_TITLE.sub('', show['assetID'].lower())
-
-			if show_title == show_name or show_asset_id == show_name:
-				show_id = show['assetID']
-				return (VIDEOS_URL % (show_id), video_id)
-
-	raise Ex.MediaNotAvailable
+	try: 
+		return JSON.ObjectFromURL(video_api, headers=HTTP_HEADERS, cacheTime=CACHE_1HOUR)
+	except: 
+		raise Ex.MediaNotAvailable
